@@ -1,7 +1,7 @@
-use std::{mem::MaybeUninit, ptr::addr_of_mut, todo};
+use std::{matches, mem::MaybeUninit, ptr::addr_of_mut};
 use crate::mem::{u16_be, divide_u8};
 
-const ZIGZAG_TO_NATURAL: [usize; 64] = [
+pub const ZIGZAG_TO_NATURAL: [usize; 64] = [
     0,  1,  8, 16,  9,  2,  3, 10,
     17, 24, 32, 25, 18, 11,  4,  5,
     12, 19, 26, 33, 40, 48, 41, 34,
@@ -12,6 +12,7 @@ const ZIGZAG_TO_NATURAL: [usize; 64] = [
     53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
+#[derive(Debug)]
 enum ParserState {
     Segment,
     Entropy,
@@ -24,11 +25,13 @@ pub struct JpegRaw<'a> {
     pub state: ParserState,
 }
 
+#[derive(Debug)]
 pub struct JpegFile {
     pub segments: Vec<JpegSegment>,
 }
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct App0Data {
     pub length: u16,
     pub version: [u8; 2],
@@ -39,6 +42,7 @@ pub struct App0Data {
 }
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct QuantizationTable {
     pub id: u8,                 // 0-3
     pub precision: u8,          // 0 = 8bits, 1 = 16 bits
@@ -46,6 +50,7 @@ pub struct QuantizationTable {
 }
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct FrameHeader {
     pub marker: u8,
     pub precision: u8,
@@ -55,6 +60,7 @@ pub struct FrameHeader {
 }
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct FrameComponent {
     pub id: u8,         // 1 = Y, 2 = Cb, 3 = Cr
     pub h_sampling: u8, // 水平采样因子
@@ -62,6 +68,8 @@ pub struct FrameComponent {
     pub quant_table_id: u8,
 }
 
+#[repr(C)]
+#[derive(Debug)]
 pub struct HuffmanTable {
     pub table_class: u8, // 0=DC, 1=AC
     pub table_id: u8,
@@ -69,12 +77,15 @@ pub struct HuffmanTable {
     pub symbols: Vec<u8>,  // 即 HUFFVAL 表
 }
 
+#[repr(C)]
+#[derive(Debug)]
 pub struct ScanHeader {
     pub components: Vec<ScanComponent>,
-    pub spectral_selection: (u8, u8, u8), // Ss, Se, Ah/Al
+    pub spectral_selection: (u8, u8, u8), // Ss, Se, Ah/Al, baseline: Ss = 0, Se = 63, Ah/Al = 0
 }
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct ScanComponent {
     pub component_id: u8,
     pub dc_table_id: u8,
@@ -82,10 +93,12 @@ pub struct ScanComponent {
 }
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct RestartInterval {
     pub interval: u16,
 }
 
+#[derive(Debug)]
 pub enum JpegSegment {
     // Independent symbol, no data
     Soi,
@@ -329,24 +342,55 @@ impl<'a> JpegRaw<'a> {
 
     // Com(Vec<u8>),            // 注释
     fn parse_com(&mut self) -> JpegSegment {
-        todo!()
+        self.addr += 2;
+        let length = self.read_u16_be();
+        let data = self.read_vec((length - 2) as usize);
+        JpegSegment::Com(data)
     }
 
     // EntropyData(Vec<u8>),
     fn parse_entropy_data(&mut self) -> JpegSegment {
-        let mut res = Vec::new();
-        loop {
-            let tmp = self.read_u8();
-            if tmp == 0xff {
-                if self.data[self.addr + 1] != 0 {
-                    self.addr -= 1;
+        let start = self.addr;
+        let data_len = self.data.len();
+
+        while self.addr < data_len {
+            if self.data[self.addr] != 0xff {
+                self.addr += 1;
+                continue;
+            }
+
+            let marker_start = self.addr;
+            let mut code_pos = marker_start + 1;
+            while code_pos < data_len && self.data[code_pos] == 0xff {
+                code_pos += 1;
+            }
+
+            if code_pos >= data_len {
+                self.addr = data_len;
+                break;
+            }
+            let marker = self.data[code_pos];
+
+            match marker {
+                0x00 if code_pos == marker_start + 1 => {
+                    self.addr = code_pos + 1;
+                },
+                0xd0..=0xd7 => {
+                    self.addr = code_pos + 1;
+                }
+                _ => {
+                    self.addr = marker_start;
+                    self.state = ParserState::Segment;
                     break;
                 }
             }
-            res.push(tmp);
         }
-        self.state = ParserState::Segment;
-        JpegSegment::EntropyData(res)
+        if self.addr >= data_len {
+            self.state = ParserState::Finished;
+        }
+        JpegSegment::EntropyData(
+            self.data[start..self.addr].to_vec()
+        )
     }
 
     fn parse_rst(&mut self) -> JpegSegment {
@@ -356,12 +400,33 @@ impl<'a> JpegRaw<'a> {
 
     // Unknown { marker: u8, data: Vec<u8> },
     fn parse_unknown(&mut self) -> JpegSegment {
-        todo!()
+        let marker = self.data[self.addr + 1];
+        self.addr += 2;
+        if marker == 0x01 {
+            return JpegSegment::Unknown { marker, data: Vec::new() };
+        }
+        let length = self.read_u16_be();
+        let data = self.read_vec((length - 2) as usize);
+        JpegSegment::Unknown { marker, data }
+    }
+
+    pub fn parse(&mut self) -> JpegFile {
+        let mut segments = Vec::new();
+        while let Some(segment) = self.parse_segment() {
+            let finished = matches!(segment, JpegSegment::Eoi);
+            segments.push(segment);
+            if finished {
+                break;
+            }
+        }
+        JpegFile { segments }
     }
 }
 
 #[test]
-fn test_volume(){
-    let val = std::mem::size_of::<ScanComponent>();
-    println!("{val}");
+fn test_parser() {
+    let file = std::fs::read("./bin/20210617054007202.jpg").unwrap();
+    let mut raw = JpegRaw::new(&file);
+    let jpeg_file = raw.parse();
+    println!("{:?}", jpeg_file);
 }
