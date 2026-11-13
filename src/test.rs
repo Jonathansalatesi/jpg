@@ -1,5 +1,5 @@
 mod example {
-    use std::{collections::HashMap, println, unreachable, usize, vec};
+    use std::{collections::HashMap, unreachable, usize, vec};
     use crate::test::{encode::{extend, series}, jpg_huffman::Coder};
     use super::jpg_huffman;
     use crate::jpeg::file::ZIGZAG_TO_NATURAL;
